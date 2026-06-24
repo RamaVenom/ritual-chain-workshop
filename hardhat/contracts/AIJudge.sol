@@ -24,9 +24,16 @@ contract AIJudge is PrecompileConsumer {
     IRitualWallet wallet =
         IRitualWallet(0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948);
 
+    // --- Commit-Reveal additions ---
+    // Submissions are now stored as a hash commitment first. The plaintext
+    // `answer` field stays empty until the submitter reveals it, after the
+    // submission window closes. This stops other participants from reading
+    // a submission and copying/improving on it before the deadline.
     struct Submission {
         address submitter;
-        string answer;
+        string answer; // empty ("") until revealed
+        bytes32 commitment; // keccak256(answer, salt, msg.sender, bountyId)
+        bool revealed;
     }
 
     struct Bounty {
@@ -34,7 +41,8 @@ contract AIJudge is PrecompileConsumer {
         string title;
         string rubric;
         uint256 reward;
-        uint256 deadline;
+        uint256 submissionDeadline; // commits must land before this
+        uint256 revealDeadline; // reveals must land before this
         bool judged;
         bool finalized;
         bytes aiReview;
@@ -55,10 +63,18 @@ contract AIJudge is PrecompileConsumer {
         address indexed owner,
         string title,
         uint256 reward,
-        uint256 deadline
+        uint256 submissionDeadline,
+        uint256 revealDeadline
     );
 
-    event AnswerSubmitted(
+    event CommitmentSubmitted(
+        uint256 indexed bountyId,
+        uint256 indexed submissionIndex,
+        address indexed submitter,
+        bytes32 commitment
+    );
+
+    event AnswerRevealed(
         uint256 indexed bountyId,
         uint256 indexed submissionIndex,
         address indexed submitter
@@ -83,10 +99,13 @@ contract AIJudge is PrecompileConsumer {
         _;
     }
 
+    /// @param submissionWindow seconds from now until the commit phase closes
+    /// @param revealWindow seconds after submissionDeadline until reveal phase closes
     function createBounty(
         string calldata title,
         string calldata rubric,
-        uint256 deadline
+        uint256 submissionWindow,
+        uint256 revealWindow
     ) external payable returns (uint256 bountyId) {
         require(msg.value > 0, "reward required");
 
@@ -98,47 +117,118 @@ contract AIJudge is PrecompileConsumer {
         bounty.title = title;
         bounty.rubric = rubric;
         bounty.reward = msg.value;
-        bounty.deadline = deadline;
+        bounty.submissionDeadline = block.timestamp + submissionWindow;
+        bounty.revealDeadline = bounty.submissionDeadline + revealWindow;
         bounty.winnerIndex = type(uint256).max;
 
-        emit BountyCreated(bountyId, msg.sender, title, msg.value, deadline);
+        emit BountyCreated(
+            bountyId,
+            msg.sender,
+            title,
+            msg.value,
+            bounty.submissionDeadline,
+            bounty.revealDeadline
+        );
     }
 
-    function submitAnswer(
+    /// @notice Step 1 (Commit): submit only a hash of your answer.
+    ///         No plaintext answer is stored on-chain at this point.
+    /// @param commitment keccak256(abi.encodePacked(answer, salt, msg.sender, bountyId))
+    function submitCommitment(
         uint256 bountyId,
-        string calldata answer
+        bytes32 commitment
     ) external bountyExists(bountyId) {
         Bounty storage bounty = bounties[bountyId];
 
-        // require(block.timestamp < bounty.deadline, "submissions closed");
+        require(
+            block.timestamp < bounty.submissionDeadline,
+            "submission phase over"
+        );
         require(!bounty.judged, "already judged");
         require(!bounty.finalized, "already finalized");
         require(
             bounty.submissions.length < MAX_SUBMISSIONS,
             "too many submissions"
         );
-        require(bytes(answer).length <= MAX_ANSWER_LENGTH, "answer too long");
 
         bounty.submissions.push(
-            Submission({submitter: msg.sender, answer: answer})
+            Submission({
+                submitter: msg.sender,
+                answer: "",
+                commitment: commitment,
+                revealed: false
+            })
         );
 
-        emit AnswerSubmitted(
+        emit CommitmentSubmitted(
             bountyId,
             bounty.submissions.length - 1,
-            msg.sender
+            msg.sender,
+            commitment
         );
     }
 
+    /// @notice Step 2 (Reveal): after the submission deadline passes, reveal
+    ///         your real answer + salt. The contract re-hashes it and checks
+    ///         it matches the commitment you submitted earlier.
+    function revealAnswer(
+        uint256 bountyId,
+        uint256 submissionIndex,
+        string calldata answer,
+        bytes32 salt
+    ) external bountyExists(bountyId) {
+        Bounty storage bounty = bounties[bountyId];
+
+        require(
+            block.timestamp >= bounty.submissionDeadline,
+            "submission phase not over"
+        );
+        require(block.timestamp < bounty.revealDeadline, "reveal phase over");
+        require(
+            submissionIndex < bounty.submissions.length,
+            "invalid index"
+        );
+        require(bytes(answer).length <= MAX_ANSWER_LENGTH, "answer too long");
+
+        Submission storage submission = bounty.submissions[submissionIndex];
+
+        require(submission.submitter == msg.sender, "not your submission");
+        require(!submission.revealed, "already revealed");
+
+        bytes32 check = keccak256(
+            abi.encodePacked(answer, salt, msg.sender, bountyId)
+        );
+        require(
+            check == submission.commitment,
+            "answer/salt does not match commitment"
+        );
+
+        submission.answer = answer;
+        submission.revealed = true;
+
+        emit AnswerRevealed(bountyId, submissionIndex, msg.sender);
+    }
+
+    /// @notice Step 3 (Judge): only runs after the reveal phase ends, and only
+    ///         judges submissions that were actually revealed. Unrevealed
+    ///         commitments are silently excluded, they never leak plaintext.
     function judgeAll(
         uint256 bountyId,
         bytes calldata llmInput
     ) external bountyExists(bountyId) onlyOwner(bountyId) {
         Bounty storage bounty = bounties[bountyId];
 
+        require(
+            block.timestamp >= bounty.revealDeadline,
+            "reveal phase not over"
+        );
         require(!bounty.judged, "already judged");
         require(!bounty.finalized, "already finalized");
         require(bounty.submissions.length > 0, "no submissions");
+
+        // llmInput must be built off-chain by the bounty owner using only
+        // submissions where `revealed == true`. Submissions that were never
+        // revealed should be skipped entirely when assembling llmInput.
 
         bytes memory output = _executePrecompile(
             LLM_INFERENCE_PRECOMPILE,
@@ -169,6 +259,10 @@ contract AIJudge is PrecompileConsumer {
 
         require(bounty.judged, "not judged yet");
         require(!bounty.finalized, "already finalized");
+        require(
+            bounty.submissions[winnerIndex].revealed,
+            "winner never revealed"
+        );
 
         bounty.finalized = true;
         bounty.winnerIndex = winnerIndex;
@@ -194,7 +288,8 @@ contract AIJudge is PrecompileConsumer {
             string memory title,
             string memory rubric,
             uint256 reward,
-            uint256 deadline,
+            uint256 submissionDeadline,
+            uint256 revealDeadline,
             bool judged,
             bool finalized,
             uint256 submissionCount,
@@ -209,7 +304,8 @@ contract AIJudge is PrecompileConsumer {
             bounty.title,
             bounty.rubric,
             bounty.reward,
-            bounty.deadline,
+            bounty.submissionDeadline,
+            bounty.revealDeadline,
             bounty.judged,
             bounty.finalized,
             bounty.submissions.length,
@@ -218,6 +314,8 @@ contract AIJudge is PrecompileConsumer {
         );
     }
 
+    /// @notice Returns the commitment and reveal status only. Does not leak
+    ///         the plaintext answer unless it has already been revealed.
     function getSubmission(
         uint256 bountyId,
         uint256 index
@@ -225,7 +323,12 @@ contract AIJudge is PrecompileConsumer {
         external
         view
         bountyExists(bountyId)
-        returns (address submitter, string memory answer)
+        returns (
+            address submitter,
+            bytes32 commitment,
+            bool revealed,
+            string memory answer
+        )
     {
         Bounty storage bounty = bounties[bountyId];
 
@@ -233,6 +336,11 @@ contract AIJudge is PrecompileConsumer {
 
         Submission storage submission = bounty.submissions[index];
 
-        return (submission.submitter, submission.answer);
+        return (
+            submission.submitter,
+            submission.commitment,
+            submission.revealed,
+            submission.revealed ? submission.answer : ""
+        );
     }
 }
